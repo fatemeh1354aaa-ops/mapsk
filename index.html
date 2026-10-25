@@ -1,0 +1,415 @@
+
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>کیمی نقشه</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css">
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<style>
+*{box-sizing:border-box}
+html,body,#map{width:100%;height:100%;margin:0}
+body{font-family:Tahoma,Arial,sans-serif;overflow:hidden;background:#eee}
+#map{position:absolute;inset:0}
+.panel{position:absolute;z-index:5;top:10px;left:10px;right:10px;background:#fff;border-radius:20px;padding:12px;box-shadow:0 4px 18px #21113c20}
+.brand{font-size:19px;font-weight:bold;color:#782be0;margin:0 0 10px}
+.search{display:flex;gap:7px}
+input{min-width:0;flex:1;border:1px solid #e5dcef;border-radius:12px;padding:12px;font:14px Tahoma;outline-color:#8b43e8}
+button{border:0;border-radius:12px;padding:11px 14px;background:#8038df;color:white;font:bold 13px Tahoma;cursor:pointer}
+button:disabled{opacity:.5}
+#results{max-height:150px;overflow:auto}
+.result{padding:11px;border-bottom:1px solid #eee;font-size:12px;line-height:1.7;cursor:pointer}
+.tools{position:absolute;z-index:4;left:12px;bottom:115px;display:flex;flex-direction:column;gap:9px}
+.tool{width:46px;height:46px;background:white;color:#7130ca;font-size:21px;padding:0;border-radius:15px;box-shadow:0 3px 12px #0002}
+#bottom{position:absolute;z-index:5;bottom:12px;left:12px;right:12px;background:white;border-radius:18px;padding:12px;box-shadow:0 4px 18px #21113c20}
+#status{font-size:12px;line-height:1.8;color:#51465e}
+.actions{display:flex;gap:7px;margin-top:8px}
+.actions button{flex:1}
+.secondary{background:#f1e8ff;color:#702bc4}
+#message{position:absolute;z-index:10;top:42%;left:18px;right:18px;margin:auto;max-width:340px;background:white;border-radius:16px;padding:16px;box-shadow:0 4px 20px #0002;text-align:center;font-size:13px;line-height:1.9}
+.hidden{display:none!important}
+
+/* فلش زیبا با نوک واضح */
+.arrow-marker{
+ width:46px;height:58px;position:relative;
+ filter:drop-shadow(0 3px 5px #28104466);
+}
+.arrow-marker svg{width:100%;height:100%;overflow:visible}
+.arrow-marker .halo{fill:#8e49ed;opacity:.18}
+.arrow-marker .body{fill:#8436e8;stroke:white;stroke-width:3.5;stroke-linejoin:round}
+.arrow-marker .shine{fill:#fff;opacity:.3}
+body.navigating .panel{opacity:.94}
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="panel" id="panel">
+  <div class="brand">💜 کیمی نقشه</div>
+  <div class="search">
+    <input id="query" placeholder="کجا می‌خوای بری؟" autocomplete="off">
+    <button id="searchBtn">جستجو</button>
+  </div>
+  <div id="results"></div>
+</div>
+
+<div class="tools">
+  <button class="tool" id="gpsBtn" title="مکان من">◎</button>
+  <button class="tool" id="followBtn" title="دنبال کردن مسیر">➤</button>
+  <button class="tool" id="viewBtn" title="نمای سه‌بعدی">3D</button>
+  <button class="tool" id="northBtn" title="جهت شمال">N</button>
+</div>
+
+<div id="bottom">
+  <div id="status">در حال بارگذاری نقشه...</div>
+  <div class="actions">
+    <button id="startBtn" disabled>شروع مسیریابی</button>
+    <button id="clearBtn" class="secondary">پاک کردن</button>
+  </div>
+</div>
+
+<div id="message" class="hidden"></div>
+
+<script>
+(() => {
+'use strict';
+
+const $ = id => document.getElementById(id);
+const status = $('status');
+
+let map, me = null, dest = null, marker = null;
+let coords = [], navigating = false, follow = true, threeD = false;
+let watch = null, searchId = 0, routeId = 0;
+let lastHeading = 0, rerouteHits = 0, lastReroute = 0;
+let lastGoodFix = null;
+
+function say(t){ status.textContent = t; }
+
+function notice(t){
+  const box = $('message');
+  box.textContent = t;
+  box.classList.remove('hidden');
+  clearTimeout(notice.timer);
+  notice.timer = setTimeout(()=>box.classList.add('hidden'),4000);
+}
+
+function rad(x){return x*Math.PI/180}
+function deg(x){return (x+360)%360}
+
+function dist(a,b){
+  const p1=rad(a[1]),p2=rad(b[1]);
+  const dp=rad(b[1]-a[1]),dl=rad(b[0]-a[0]);
+  const h=Math.sin(dp/2)**2+
+    Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
+  return 6371000*2*Math.atan2(Math.sqrt(h),Math.sqrt(1-h));
+}
+
+function bearing(a,b){
+  const p1=rad(a[1]),p2=rad(b[1]),dl=rad(b[0]-a[0]);
+  return deg(Math.atan2(
+    Math.sin(dl)*Math.cos(p2),
+    Math.cos(p1)*Math.sin(p2)-
+    Math.sin(p1)*Math.cos(p2)*Math.cos(dl)
+  )*180/Math.PI);
+}
+
+function nearest(p){
+  let best=Infinity,index=0;
+  for(let i=0;i<coords.length;i++){
+    const d=dist(p,coords[i]);
+    if(d<best){best=d;index=i}
+  }
+  return {distance:best,index};
+}
+
+function routeHeading(p){
+  if(coords.length<2)return lastHeading;
+  const n=nearest(p).index;
+  const a=coords[n],b=coords[Math.min(n+1,coords.length-1)];
+  if(!b || dist(a,b)<1)return lastHeading;
+  return bearing(a,b);
+}
+
+function createMarker(){
+  if(marker)return;
+  const el=document.createElement('div');
+  el.className='arrow-marker';
+  el.innerHTML=`
+  <svg viewBox="0 0 46 58" aria-label="مکان و جهت حرکت">
+    <path class="halo" d="M23 1 L44 49 L23 42 L2 49 Z"/>
+    <path class="body" d="M23 2 L42 48 L23 40 L4 48 Z"/>
+    <path class="shine" d="M23 9 L23 35 L11 40 Z"/>
+  </svg>`;
+  marker=new maplibregl.Marker({
+    element:el,
+    anchor:'center',
+    rotationAlignment:'viewport'
+  }).setLngLat(me).addTo(map);
+}
+
+function setArrow(){
+  if(!me)return;
+  createMarker();
+  marker.setLngLat(me);
+  // فلش همیشه رو به بالای صفحه است؛ دوربین برای دنبال‌کردن می‌چرخد.
+  marker.setRotation(0);
+}
+
+function cameraBehind(position,heading,animate=true){
+  if(!position)return;
+  lastHeading=heading;
+  const topPadding=Math.min(190,Math.round(window.innerHeight*.23));
+  const options={
+    center:position,
+    zoom:navigating?18:16,
+    bearing:heading,
+    pitch:navigating?60:(threeD?55:0),
+    padding:{top:topPadding,bottom:10,left:0,right:0},
+    duration:animate?650:0
+  };
+  map.easeTo(options);
+}
+
+function showPosition(pos){
+  const c=[pos.coords.longitude,pos.coords.latitude];
+  const accuracy=pos.coords.accuracy||999;
+  const old=me;
+  me=c;
+  lastGoodFix=pos;
+  setArrow();
+
+  let heading=null;
+  if(navigating && coords.length>1) heading=routeHeading(me);
+  else if(pos.coords.heading!=null &&
+          Number.isFinite(pos.coords.heading) &&
+          pos.coords.speed>0.8) heading=pos.coords.heading;
+  else if(old && dist(old,me)>3) heading=bearing(old,me);
+
+  if(heading!=null)lastHeading=heading;
+
+  if(follow){
+    cameraBehind(me,lastHeading,false);
+  }
+
+  if(navigating && coords.length>1){
+    const n=nearest(me);
+    say('مسیریابی فعال • فاصله تا خط مسیر: '+Math.round(n.distance)+' متر');
+
+    if(n.distance>45 && accuracy<35){
+      rerouteHits++;
+      if(rerouteHits>=3 && Date.now()-lastReroute>12000){
+        rerouteHits=0;
+        lastReroute=Date.now();
+        buildRoute(true);
+      }
+    }else{
+      rerouteHits=0;
+    }
+  }else{
+    say(accuracy>60
+      ?'مکان پیدا شد، اما دقت GPS پایین است.'
+      :'مکان شما پیدا شد.');
+  }
+}
+
+function gpsError(e){
+  if(e.code===1)say('اجازهٔ مکان‌یابی را در مرورگر فعال کن.');
+  else if(e.code===2)say('مکان پیدا نشد؛ GPS گوشی را بررسی کن.');
+  else say('مکان‌یابی طول کشید؛ دوباره روی ◎ بزن.');
+}
+
+function startGPS(){
+  if(!navigator.geolocation){
+    notice('این مرورگر از GPS پشتیبانی نمی‌کند.');
+    return;
+  }
+  if(watch!==null)navigator.geolocation.clearWatch(watch);
+  say('در حال پیدا کردن مکان شما...');
+  watch=navigator.geolocation.watchPosition(showPosition,gpsError,{
+    enableHighAccuracy:true,maximumAge:1000,timeout:20000
+  });
+}
+
+async function search(){
+  const q=$('query').value.trim();
+  if(!q)return;
+  const id=++searchId;
+  $('results').textContent='در حال جستجو...';
+  try{
+    const url='https://nominatim.openstreetmap.org/search?format=jsonv2&limit=6&accept-language=fa&q='+encodeURIComponent(q);
+    const r=await fetch(url);
+    if(!r.ok)throw Error();
+    const data=await r.json();
+    if(id!==searchId)return;
+    $('results').innerHTML='';
+    if(!data.length){
+      $('results').textContent='مقصد پیدا نشد.';
+      return;
+    }
+    data.forEach(p=>{
+      const row=document.createElement('div');
+      row.className='result';
+      row.textContent=p.display_name;
+      row.onclick=()=>{
+        dest=[Number(p.lon),Number(p.lat)];
+        $('query').value=p.display_name.split(',')[0];
+        $('results').innerHTML='';
+        $('startBtn').disabled=false;
+        map.flyTo({center:dest,zoom:15,pitch:threeD?50:0});
+        say('مقصد انتخاب شد؛ شروع مسیریابی را بزن.');
+      };
+      $('results').appendChild(row);
+    });
+  }catch(e){
+    $('results').textContent='جستجو ناموفق بود؛ اینترنت را بررسی کن.';
+  }
+}
+
+function ensureRoute(){
+  if(!map.getSource('kimi-route')){
+    map.addSource('kimi-route',{
+      type:'geojson',
+      data:{type:'FeatureCollection',features:[]}
+    });
+  }
+  if(!map.getLayer('kimi-casing')){
+    map.addLayer({
+      id:'kimi-casing',type:'line',source:'kimi-route',
+      layout:{'line-cap':'round','line-join':'round'},
+      paint:{'line-color':'#fff','line-width':12}
+    });
+  }
+  if(!map.getLayer('kimi-line')){
+    map.addLayer({
+      id:'kimi-line',type:'line',source:'kimi-route',
+      layout:{'line-cap':'round','line-join':'round'},
+      paint:{'line-color':'#8537e8','line-width':7}
+    });
+  }
+}
+
+function paintRoute(){
+  ensureRoute();
+  map.getSource('kimi-route').setData({
+    type:'Feature',
+    properties:{},
+    geometry:{type:'LineString',coordinates:coords}
+  });
+}
+
+async function buildRoute(automatic=false){
+  if(!dest){notice('اول مقصد را جستجو کن.');return}
+  if(!me){notice('اول مکان من را پیدا کن.');startGPS();return}
+  const id=++routeId;
+  $('startBtn').disabled=true;
+  say(automatic?'در حال پیدا کردن مسیر جدید...':'در حال ساخت مسیر...');
+
+  try{
+    const url='https://router.project-osrm.org/route/v1/driving/'+
+      me.join(',')+';'+dest.join(',')+
+      '?overview=full&geometries=geojson&steps=true';
+    const r=await fetch(url);
+    if(!r.ok)throw Error('network');
+    const data=await r.json();
+    if(id!==routeId)return;
+    if(data.code!=='Ok'||!data.routes?.length)throw Error('route');
+
+    coords=data.routes[0].geometry.coordinates;
+    if(coords.length<2)throw Error('short');
+    paintRoute();
+    navigating=true;
+    follow=true;
+    rerouteHits=0;
+    document.body.classList.add('navigating');
+    $('startBtn').textContent='مسیریابی فعال است';
+
+    const initialHeading=routeHeading(me);
+    lastHeading=initialHeading;
+    cameraBehind(me,initialHeading,true);
+    say('مسیر آماده است • '+(data.routes[0].distance/1000).toFixed(1)+' کیلومتر');
+  }catch(e){
+    if(id===routeId){
+      say('ساخت مسیر ناموفق بود؛ دوباره امتحان کن.');
+      notice('سرویس مسیریابی پاسخ نداد یا اینترنت قطع است.');
+    }
+  }finally{
+    $('startBtn').disabled=false;
+  }
+}
+
+function clearRoute(){
+  routeId++;
+  navigating=false;
+  coords=[];
+  rerouteHits=0;
+  document.body.classList.remove('navigating');
+  if(map.getSource('kimi-route')){
+    map.getSource('kimi-route').setData({type:'FeatureCollection',features:[]});
+  }
+  $('startBtn').textContent='شروع مسیریابی';
+  if(me){
+    map.easeTo({center:me,zoom:16,bearing:0,pitch:threeD?55:0,
+      padding:{top:0,bottom:0,left:0,right:0},duration:500});
+  }
+  say(me?'مسیر پاک شد.':'برای مکان فعلی روی ◎ بزن.');
+}
+
+function toggle3D(){
+  threeD=!threeD;
+  if(navigating){
+    map.easeTo({pitch:threeD?65:45,duration:500});
+  }else{
+    map.easeTo({pitch:threeD?55:0,duration:500});
+  }
+  $('viewBtn').textContent=threeD?'2D':'3D';
+}
+
+$('searchBtn').onclick=search;
+$('query').addEventListener('keydown',e=>{if(e.key==='Enter')search()});
+$('startBtn').onclick=()=>buildRoute(false);
+$('clearBtn').onclick=clearRoute;
+$('gpsBtn').onclick=()=>{
+  follow=true;
+  if(me)cameraBehind(me,lastHeading,true);
+  else startGPS();
+};
+$('followBtn').onclick=()=>{
+  follow=!follow;
+  $('followBtn').style.background=follow?'#fff':'#eadbff';
+  if(follow && me)cameraBehind(me,lastHeading,true);
+};
+$('viewBtn').onclick=toggle3D;
+$('northBtn').onclick=()=>{
+  follow=false;
+  map.easeTo({bearing:0,pitch:0,duration:500});
+};
+
+try{
+  map=new maplibregl.Map({
+    container:'map',
+    style:'https://tiles.openfreemap.org/styles/bright',
+    center:[13.405,52.52],
+    zoom:5,
+    attributionControl:true
+  });
+
+  map.addControl(new maplibregl.NavigationControl(),'bottom-right');
+
+  map.on('load',()=>{
+    ensureRoute();
+    say('نقشه آماده است؛ مکان من را پیدا می‌کنیم...');
+    startGPS();
+  });
+
+  map.on('error',e=>{
+    console.warn('Map loading error',e.error||e);
+  });
+
+}catch(e){
+  say('نقشه راه‌اندازی نشد. اتصال اینترنت را بررسی کن.');
+}
+})();
+</script>
+</body>
+</html>
